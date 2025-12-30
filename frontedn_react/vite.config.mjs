@@ -13,6 +13,10 @@ export default defineConfig({
     },
     include: ['react', 'react-dom', 'react-router-dom']
   },
+  // Expose environment variables to the client
+  define: {
+    'process.env.REACT_APP_BACKEND_URL': JSON.stringify(process.env.REACT_APP_BACKEND_URL || process.env.VITE_BACKEND_URL),
+  },
   server: {
     proxy: {
       '/api': {

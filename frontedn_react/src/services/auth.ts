@@ -20,7 +20,11 @@ export const authService = {
       if (error.response?.data?.error) {
         return { success: false, error: error.response.data.error };
       } else if (error.request) {
-        return { success: false, error: 'Cannot connect to server. Make sure backend is running on port 5000.' };
+        const backendUrl = import.meta.env.VITE_BACKEND_URL || 
+                          import.meta.env.REACT_APP_BACKEND_URL || 
+                          process.env.REACT_APP_BACKEND_URL ||
+                          'http://127.0.0.1:5000';
+        return { success: false, error: `Cannot connect to server at ${backendUrl}. Please check your backend URL configuration.` };
       } else {
         return { success: false, error: 'Login failed' };
       }
