@@ -1,0 +1,945 @@
+from flask import Blueprint, request, jsonify, g, current_app
+import os
+from datetime import datetime
+from supabase import create_client
+import traceback
+import jwt
+from functools import wraps
+
+# Create the main notifications blueprint
+notification_bp = Blueprint('notifications', __name__)
+
+def get_supabase_client():
+    try:
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+        if not supabase_url or not supabase_key:
+            raise Exception("Supabase credentials not configured")
+        return create_client(supabase_url, supabase_key)
+    except Exception as e:
+        print(f"❌ get_supabase_client ERROR: {str(e)}")
+        raise
+
+import os
+from datetime import datetime, timedelta
+
+
+def notifications_token_required(f):
+    """Custom token decorator specifically for notifications that allows admin without employee_id"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        print(f"🔐 NOTIFICATIONS TOKEN CHECK for {f.__name__}")
+        
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'error': 'Token is missing'}), 401
+        
+        try:
+            # Remove 'Bearer ' prefix if present
+            if token.startswith('Bearer '):
+                token = token[7:]
+            
+            # Decode token
+            data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+            
+            # Store user data in g
+            g.user = data
+            
+            user_role = data.get('role')
+            employee_id = data.get('employee_id')
+            
+            print(f"🔐 Notifications token - role: {user_role}, employee_id: {employee_id}")
+            print(f"✅ NOTIFICATIONS ACCESS GRANTED to {user_role}")
+            
+            return f(*args, **kwargs)
+                
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Token is invalid'}), 401
+        except Exception as e:
+            print(f"❌ Token validation error: {str(e)}")
+            return jsonify({'error': 'Token validation failed'}), 401
+        
+    return decorated
+
+def get_user_notification_target():
+    """Determine how notifications should be scoped for the current user"""
+    try:
+        if not hasattr(g, 'user') or not g.user:
+            return None
+        
+        user_role = g.user.get('role')
+        employee_id = g.user.get('employee_id')
+        
+        # Prefer targeted feed if we have an employee_id
+        if employee_id:
+            return {
+                'scope': 'employee',
+                'value': str(employee_id),
+                'role': user_role
+            }
+        
+        # Fallback: admin without employee record sees full feed
+        if user_role in ['admin', 'superadmin']:
+            return {
+                'scope': 'admin_all',
+                'value': None,
+                'role': user_role
+            }
+        
+        return None
+        
+    except Exception as e:
+        print(f"❌ get_user_notification_target ERROR: {str(e)}")
+        return None
+
+
+def create_enhanced_task_notification(task_id, notification_type, message, assigned_by=None, note_preview=None, attached_to=None, attached_to_multiple=None, old_progress=None, new_progress=None):
+    """CORRECTED notification function that properly includes attached employees for notes"""
+    try:
+        supabase = get_supabase_client()
+        
+        # Get task details
+        task_result = supabase.table("tasks").select("title, description, assigned_to, assigned_to_multiple").eq("id", task_id).execute()
+        if not task_result.data:
+            print(f"❌ Task {task_id} not found for notification")
+            return
+        
+        task = task_result.data[0]
+        task_title = task.get('title') or task.get('description', 'Task')[:50]
+        
+        # Get admin employees (including superadmin from environment)
+        admin_employees = get_admin_employees()
+        admin_employee_ids = [admin['id'] for admin in admin_employees]
+        
+        # Get current user's role and info
+        current_user_role = g.user.get('role') if hasattr(g, 'user') and g.user else None
+        current_user_employee_id = g.user.get('employee_id') if hasattr(g, 'user') and g.user else None
+        current_user_name = "Unknown"
+        
+        if current_user_employee_id:
+            employee_result = supabase.table("employees").select("name").eq("id", current_user_employee_id).execute()
+            if employee_result.data:
+                current_user_name = employee_result.data[0].get('name', 'Unknown')
+        else:
+            current_user_name = g.user.get('name', 'Unknown')
+
+        print(f"🔍 Task {task_id} - Current user: {current_user_name} (role: {current_user_role})")
+
+        # ========== CORRECTED NOTIFICATION LOGIC ==========
+        recipients = set()
+        
+        # Get all assigned employees for the task
+        assigned_employees = set()
+        if task.get('assigned_to'):
+            assigned_employees.add(task['assigned_to'])
+        if task.get('assigned_to_multiple'):
+            assigned_employees.update(task['assigned_to_multiple'])
+        
+        # Get attached employees from function parameters
+        attached_employees = set()
+        if attached_to:
+            attached_employees.add(attached_to)
+        if attached_to_multiple:
+            attached_employees.update(attached_to_multiple)
+        
+        print(f"🔍 Assigned employees: {assigned_employees}")
+        print(f"🔍 Attached employees: {attached_employees}")
+        print(f"🔍 Notification type: {notification_type}")
+
+        # ========== SEPARATE NOTIFICATION TYPES ==========
+        
+        # 1. PROGRESS UPDATES (Separate notification)
+        if notification_type == "progress_updated":
+            # Notify ALL employees and ALL admins for any progress update
+            # Get all active employees
+            try:
+                all_employees_result = supabase.table("employees").select("id").eq("is_active", True).execute()
+                if all_employees_result.data:
+                    all_employee_ids = [emp['id'] for emp in all_employees_result.data]
+                    recipients.update(all_employee_ids)
+                    recipients.update(admin_employee_ids)  # Also include admins
+                    print(f"📊 Progress update - notifying ALL employees ({len(all_employee_ids)}) and ALL admins ({len(admin_employee_ids)})")
+                else:
+                    # Fallback: notify admins and assigned employees
+                    recipients.update(admin_employee_ids)
+                    recipients.update(assigned_employees)
+                    print("📊 Progress update - notifying admins and assigned employees (fallback)")
+            except Exception as e:
+                print(f"⚠️ Error getting all employees, using fallback: {e}")
+                # Fallback: notify admins and assigned employees
+                recipients.update(admin_employee_ids)
+                recipients.update(assigned_employees)
+            
+            # Remove current user from recipients (no self-notifications)
+            if current_user_employee_id and current_user_employee_id in recipients:
+                recipients.remove(current_user_employee_id)
+                
+            # Create progress notification
+            if recipients:
+                progress_message = f"📊 Progress updated"
+                if old_progress is not None and new_progress is not None:
+                    progress_message = f"📊 Progress updated from {old_progress}% to {new_progress}% on task: {task_title}..."
+                elif new_progress is not None:
+                    progress_message = f"📊 Progress updated to {new_progress}% on task: {task_title}..."
+                
+                create_single_notification(
+                    supabase, task_id, "progress_updated", progress_message, recipients,
+                    task, current_user_name, current_user_role, None,  # No note preview for progress
+                    attached_to, attached_to_multiple, is_note=False
+                )
+            
+            # Return after progress notification - don't create additional notifications
+            return
+
+        # 2. NOTES & MESSAGES (Separate notification) - Notify ALL employees and ALL admins
+        elif notification_type == "note_added":
+            # Notify ALL employees and ALL admins for any note
+            # Get all active employees
+            try:
+                all_employees_result = supabase.table("employees").select("id").eq("is_active", True).execute()
+                if all_employees_result.data:
+                    all_employee_ids = [emp['id'] for emp in all_employees_result.data]
+                    recipients.update(all_employee_ids)
+                    recipients.update(admin_employee_ids)  # Also include admins
+                    print(f"📝 Note added - notifying ALL employees ({len(all_employee_ids)}) and ALL admins ({len(admin_employee_ids)})")
+                else:
+                    # Fallback: notify admins, assigned employees, and attached employees
+                    recipients.update(admin_employee_ids)
+                    recipients.update(assigned_employees)
+                    recipients.update(attached_employees)
+                    print("📝 Note added - notifying admins, assigned, and attached employees (fallback)")
+            except Exception as e:
+                print(f"⚠️ Error getting all employees, using fallback: {e}")
+                # Fallback: notify admins, assigned employees, and attached employees
+                recipients.update(admin_employee_ids)
+                recipients.update(assigned_employees)
+                recipients.update(attached_employees)
+            
+            # Track who originally attached the current employee (for response notifications)
+            attached_by_employee_id = None
+            if current_user_role == 'employee':
+                # CRITICAL: Find who originally attached this employee and notify them
+                print(f"📝 Employee {current_user_employee_id} adding note to task {task_id}")
+                
+                print(f"🎯 Recipients after initial update: {recipients}")
+
+                try:
+                    # Find the note where THIS employee was attached (the one that triggered their ability to respond)
+                    employee_id_str = str(current_user_employee_id)
+                    print(f"🔍 Looking for who attached employee {employee_id_str} in task {task_id}")
+                    
+                    # Query all notes for this task (including the one just created)
+                    all_updates = supabase.table("task_updates") \
+                        .select("id, updated_by, attached_to, attached_to_multiple, created_at") \
+                        .eq("task_id", task_id) \
+                        .order("created_at", desc=True) \
+                        .execute()
+                    
+                    print(f"🔍 Found {len(all_updates.data) if all_updates.data else 0} total updates for this task")
+                    
+                    if all_updates.data:
+                        # Find the most recent note where this employee was attached
+                        for idx, update in enumerate(all_updates.data):
+                            update_creator = update.get('updated_by')
+                            
+                            # Skip the current update (the response itself)
+                            if update_creator == current_user_employee_id:
+                                print(f"⏭️  Skipping update {idx} - created by current user")
+                                continue
+                            
+                            # Check if this employee was attached in this note
+                            update_attached_to = update.get('attached_to')
+                            update_attached_multiple = update.get('attached_to_multiple') or []
+                            
+                            print(f"🔍 Checking update {idx}: creator={update_creator}, attached_to={update_attached_to}, attached_to_multiple={update_attached_multiple}")
+                            
+                            was_attached_here = False
+                            
+                            # Check attached_to
+                            if update_attached_to:
+                                if str(update_attached_to) == employee_id_str:
+                                    was_attached_here = True
+                                    print(f"✅ Found match in attached_to: {update_attached_to}")
+                            
+                            # Check attached_to_multiple
+                            if not was_attached_here and isinstance(update_attached_multiple, list):
+                                attached_multiple_str = [str(id) for id in update_attached_multiple]
+                                if employee_id_str in attached_multiple_str:
+                                    was_attached_here = True
+                                    print(f"✅ Found match in attached_to_multiple: {attached_multiple_str}")
+                            
+                            # If this employee was attached in this note, notify the person who created it
+                            if was_attached_here:
+                                note_creator_id = update.get('updated_by')
+                                if note_creator_id and note_creator_id != current_user_employee_id:
+                                    recipients.add(note_creator_id)
+                                    attached_by_employee_id = note_creator_id
+                                    print(f"🧭 ✅ FOUND! Employee {current_user_employee_id} was attached by {note_creator_id} - adding to recipients")
+                                    print(f"🎯 Recipients before: {recipients}")
+                                    break  # Only notify the most recent one who attached them
+                        else:
+                            print(f"⚠️ No note found where employee {current_user_employee_id} was attached")
+                    else:
+                        print(f"⚠️ No updates found for task {task_id}")
+                                    
+                except Exception as e:
+                    print(f"⚠️ Failed to find who attached this employee for notifications: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                print(f"🎯 Final recipients after lookup: {recipients}")
+
+                print("📝 Employee added note - notifying admins, task assignees, attached employees AND the person who attached them")
+            
+            # Remove current user from recipients (no self-notifications)
+            print(f"🎯 Recipients BEFORE removing current user: {recipients}")
+            if current_user_employee_id and current_user_employee_id in recipients:
+                recipients.remove(current_user_employee_id)
+                print(f"🗑️  Removed current user {current_user_employee_id} from recipients")
+            
+            print(f"🎯 Final recipients AFTER removing current user: {recipients}")
+            print(f"🎯 Recipients count: {len(recipients)}")
+            
+            # Create note notifications
+            if recipients:
+                # Default message for general note notifications
+                default_note_message = f"📝 Note added to task: {task_title}..."
+
+                # If we know exactly who attached this employee, send them a special \"response\" notification
+                owner_recipients = set()
+                if attached_by_employee_id and attached_by_employee_id in recipients:
+                    owner_recipients.add(attached_by_employee_id)
+                
+                # 1) Special notification for the person who attached this employee
+                if owner_recipients:
+                    owner_message = f"💬 You got a response to your note on task: {task_title}..."
+                    print(f"📨 Sending owner response notification to: {owner_recipients}")
+                    create_single_notification(
+                        supabase,
+                        task_id,
+                        "note_added",
+                        owner_message,
+                        owner_recipients,
+                        task,
+                        current_user_name,
+                        current_user_role,
+                        note_preview,
+                        attached_to,
+                        attached_to_multiple,
+                        is_note=True,
+                        is_task_owner_confirmation=True
+                    )
+                    # Remove owners from general recipients
+                    recipients = recipients - owner_recipients
+
+                # 2) General note notification for everyone else
+                if recipients:
+                    print(f"📨 Sending general note notification to: {recipients}")
+                    create_single_notification(
+                        supabase,
+                        task_id,
+                        "note_added",
+                        default_note_message,
+                        recipients,
+                        task,
+                        current_user_name,
+                        current_user_role,
+                        note_preview,
+                        attached_to,
+                        attached_to_multiple,
+                        is_note=True,
+                        is_task_owner_confirmation=False
+                    )
+            return
+
+        # 3. FILE UPLOADS & ATTACHMENTS - Notify ALL employees and ALL admins
+        elif notification_type == "file_uploaded":
+            # Notify ALL employees and ALL admins for any file upload
+            # Get all active employees
+            try:
+                all_employees_result = supabase.table("employees").select("id").eq("is_active", True).execute()
+                if all_employees_result.data:
+                    all_employee_ids = [emp['id'] for emp in all_employees_result.data]
+                    recipients.update(all_employee_ids)
+                    recipients.update(admin_employee_ids)  # Also include admins
+                    print(f"📎 File uploaded - notifying ALL employees ({len(all_employee_ids)}) and ALL admins ({len(admin_employee_ids)})")
+                else:
+                    # Fallback: notify admins and assigned employees
+                    recipients.update(admin_employee_ids)
+                    recipients.update(assigned_employees)
+                    recipients.update(attached_employees)
+                    print("📎 File uploaded - notifying admins, assigned, and attached employees (fallback)")
+            except Exception as e:
+                print(f"⚠️ Error getting all employees, using fallback: {e}")
+                # Fallback: notify admins and assigned employees
+                recipients.update(admin_employee_ids)
+                recipients.update(assigned_employees)
+                recipients.update(attached_employees)
+        
+        # 4. TASK ASSIGNMENTS & UPDATES
+        elif notification_type == "task_assigned":
+            # Task assigned/created: Notify all assigned employees + attached employees (excluding assigner)
+            recipients.update(assigned_employees)
+            recipients.update(attached_employees)  # Include attached employees
+            print("📋 Task assigned - notifying assigned employees AND attached employees")
+            
+        elif notification_type == "task_status_changed":
+            # Task status changed: Notify opposite side + attached employees
+            if current_user_role in ['admin', 'superadmin']:
+                # Admin changed status: Notify assigned employees + attached employees
+                recipients.update(assigned_employees)
+                recipients.update(attached_employees)  # Include attached employees
+            else:
+                # Employee changed status: Notify admins + attached employees
+                recipients.update(admin_employee_ids)
+                recipients.update(attached_employees)  # Include attached employees
+            print(f"🔄 Task status changed by {current_user_role} - notifying opposite side AND attached employees")
+        
+        elif notification_type == "task_updated":
+            # General task updates: Notify opposite side + attached employees
+            if current_user_role in ['admin', 'superadmin']:
+                recipients.update(assigned_employees)
+                recipients.update(attached_employees)  # Include attached employees
+            else:
+                recipients.update(admin_employee_ids)
+                recipients.update(attached_employees)  # Include attached employees
+            print(f"📝 Task updated by {current_user_role} - notifying opposite side AND attached employees")
+        
+        else:
+            print(f"⚠️ Unknown notification type: {notification_type}")
+            return
+
+        # CRITICAL: Remove the current user from recipients for ALL notification types
+        if current_user_employee_id and current_user_employee_id in recipients:
+            recipients.remove(current_user_employee_id)
+
+        print(f"🎯 Final recipients for {notification_type}: {recipients}")
+
+        # Create notifications for non-progress/note types
+        if recipients:
+            # Format message based on notification type
+            final_message = message
+            if notification_type == "file_uploaded":
+                final_message = f"📎 {message}"
+            elif notification_type == "task_status_changed":
+                final_message = f"🔄 {message}"
+            elif notification_type == "task_assigned":
+                final_message = f"📋 {message}"
+            elif notification_type == "task_updated":
+                final_message = f"✏️ {message}"
+            
+            # Create the notification
+            create_single_notification(
+                supabase, task_id, notification_type, final_message, recipients,
+                task, current_user_name, current_user_role, note_preview,
+                attached_to, attached_to_multiple, is_note=(notification_type == "note_added")
+            )
+        else:
+            print("⚠️ No recipients to notify")
+                
+    except Exception as e:
+        print(f"⚠️ Failed to create notification: {e}")
+        traceback.print_exc()
+
+def get_admin_employees():
+    """Get all admin employee IDs, including superadmin from environment"""
+    supabase = get_supabase_client()
+    
+    # First, get all admins and superadmins from the database
+    result = supabase.table("employees").select("id, email, name, role").in_("role", ["admin", "superadmin"]).execute()
+    
+    admin_employees = []
+    if result.data:
+        admin_employees = result.data
+    
+    # If no admins found in database, use the superadmin from environment
+    if not admin_employees:
+        superadmin_email = os.getenv('SUPERADMIN_EMAIL')
+        if superadmin_email:
+            print(f"🔧 Using SUPERADMIN_EMAIL from environment: {superadmin_email}")
+            # Create a placeholder admin employee using the superadmin email
+            admin_employees = [{
+                'id': 'superadmin-default',
+                'email': superadmin_email,
+                'name': 'System Superadmin',
+                'role': 'superadmin'
+            }]
+    
+    print(f"🔧 Admin employees found: {len(admin_employees)}")
+    return admin_employees
+
+def create_single_notification(
+    supabase,
+    task_id,
+    notification_type,
+    message,
+    recipients,
+    task,
+    current_user_name,
+    current_user_role,
+    note_preview,
+    attached_to,
+    attached_to_multiple,
+    is_note=False,
+    assigned_by=None,
+    is_task_owner_confirmation=False
+):
+    """Helper function to create notifications for one or more recipients"""
+    for recipient in recipients:
+        if recipient:  # Ensure recipient is not None
+            # DEDUPLICATION: Check for recent duplicate notification (last 2 minutes)
+            duplicate_check = supabase.table("notifications").select("id").eq("meta->>task_id", task_id).eq("meta->>type", notification_type).eq("to_employee", recipient).gte("created_at", (datetime.utcnow() - timedelta(minutes=2)).isoformat()).execute()
+            
+            if duplicate_check.data:
+                print(f"⏭️  Skipping duplicate notification for task {task_id}, type {notification_type}")
+                continue
+
+            # Remove double emoji formatting since it's already done in the calling function
+            final_message = message
+
+            notification_data = {
+                "to_employee": recipient,
+                "channel": "in_app",
+                "message": final_message,
+                "type": notification_type,
+                "related_task_id": task_id if task_id else None,
+                "meta": {
+                    "task_id": task_id,
+                    "task_title": task.get('title') or task.get('description', 'Task')[:100], 
+                    "type": notification_type,
+                    "assigned_by": assigned_by,
+                    "added_by": current_user_name,
+                    "user_role": current_user_role,
+                    "note_preview": note_preview if is_note else None,  # Only include note preview for note notifications
+                    "specially_attached": True if attached_to or attached_to_multiple else False,
+                    "attached_to": attached_to,
+                    "attached_to_multiple": attached_to_multiple,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "is_note_notification": is_note,
+                    "is_attachment_notification": not is_note and notification_type == "file_uploaded",
+                    "is_task_owner_confirmation": is_task_owner_confirmation
+                },
+                "priority": "normal",
+                "created_at": datetime.utcnow().isoformat(),
+                "is_read": False
+            }
+            
+            try:
+                result = supabase.table("notifications").insert(notification_data).execute()
+                if result.data:
+                    print(f"✅ Notification created for {recipient}: {final_message}")
+                else:
+                    print(f"❌ Failed to create notification for {recipient}")
+            except Exception as e:
+                print(f"❌ Error creating notification for {recipient}: {e}")
+
+
+def create_admin_event_notification(notification_type, message, meta=None, exclude_employee_id=None):
+    """Send notifications to admin users for global events"""
+    try:
+        supabase = get_supabase_client()
+        admin_employees = get_admin_employees()
+        recipients = set()
+        
+        for admin in admin_employees:
+            admin_id = admin.get('id')
+            if not admin_id:
+                continue
+            if exclude_employee_id and str(admin_id) == str(exclude_employee_id):
+                continue
+            recipients.add(str(admin_id))
+        
+        if not recipients:
+            print("⚠️ No admin recipients for admin event notification")
+            return
+        
+        for recipient in recipients:
+            duplicate_check = (
+                supabase
+                .table("notifications")
+                .select("id")
+                .eq("meta->>type", notification_type)
+                .eq("to_employee", recipient)
+                .gte("created_at", (datetime.utcnow() - timedelta(minutes=2)).isoformat())
+                .execute()
+            )
+            if duplicate_check.data:
+                print(f"⏭️  Skipping duplicate admin event notification ({notification_type}) for {recipient}")
+                continue
+            
+            notification_meta = {
+                "type": notification_type,
+                "category": "admin_event",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            if meta:
+                notification_meta.update(meta)
+            
+            notification_data = {
+                "to_employee": recipient,
+                "channel": "in_app",
+                "message": message,
+                "meta": notification_meta,
+                "priority": "normal",
+                "created_at": datetime.utcnow().isoformat(),
+                "is_read": False
+            }
+            
+            try:
+                result = supabase.table("notifications").insert(notification_data).execute()
+                if result.data:
+                    print(f"✅ Admin event notification created for {recipient}: {message}")
+                else:
+                    print(f"❌ Failed to create admin event notification for {recipient}")
+            except Exception as e:
+                print(f"❌ Error creating admin event notification for {recipient}: {e}")
+    except Exception as e:
+        print(f"❌ create_admin_event_notification ERROR: {e}")
+# ===== MAIN NOTIFICATIONS ENDPOINT - FIXED =====
+@notification_bp.route('/api/notifications', methods=['GET'])
+@notifications_token_required  # ← THIS IS THE KEY FIX
+def get_notifications():
+    """Get notifications for current user - FIXED VERSION"""
+    try:
+        print("🚀 MAIN NOTIFICATIONS ENDPOINT CALLED")
+        
+        supabase = get_supabase_client()
+        user_target = get_user_notification_target()
+        
+        print(f"🎯 User target: {user_target}")
+        print(f"🔍 g.user: {g.user}")
+        
+        if not user_target:
+            return jsonify({
+                'success': False, 
+                'error': 'Could not identify user for notifications'
+            }), 400
+        
+        target_scope = user_target.get('scope')
+        target_value = user_target.get('value')
+        user_role = user_target.get('role')
+        
+        # Admin sees all notifications only when no employee ID is available
+        base_columns = [
+            "id", "to_employee", "channel", "message",
+            "meta", "priority", "is_read", "created_at"
+        ]
+        select_clause = ",".join(base_columns)
+
+        if target_scope == "admin_all":
+            print("👑 Admin (no employee record) - fetching ALL notifications")
+            result = (
+                supabase.table("notifications")
+                .select(select_clause)
+                .order("created_at", desc=True)
+                .limit(500)
+                .execute()
+            )
+            feed_scope = 'admin_all'
+        elif target_scope == "employee" and target_value:
+            print(f"🎯 Scoped notifications for employee: {target_value}")
+            result = (
+                supabase.table("notifications")
+                .select(select_clause)
+                .eq("to_employee", target_value)
+                .order("created_at", desc=True)
+                .limit(200)
+                .execute()
+            )
+            feed_scope = 'admin' if user_role in ['admin', 'superadmin'] else 'employee'
+        else:
+            return jsonify({'success': False, 'error': 'Invalid notification target'}), 400
+        
+        notifications = result.data if result.data else []
+        unread_count = len([n for n in notifications if not n.get('is_read', False)])
+        
+        print(f"✅ SUCCESS - {len(notifications)} notifications, {unread_count} unread")
+        
+        return jsonify({
+            'success': True,
+            'notifications': notifications,
+            'unread_count': unread_count,
+            'total': len(notifications),
+            'user_type': 'admin' if user_role in ['admin', 'superadmin'] else 'employee',
+            'feed_scope': feed_scope
+        })
+        
+    except Exception as e:
+        print(f"❌ get_notifications ERROR: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ===== ALL OTHER ENDPOINTS =====
+@notification_bp.route('/api/notifications/<notification_id>/read', methods=['PUT'])
+@notifications_token_required
+def mark_notification_read(notification_id):
+    """Mark a notification as read"""
+    try:
+        supabase = get_supabase_client()
+        user_target = get_user_notification_target()
+        
+        if not user_target:
+            return jsonify({'success': False, 'error': 'Could not identify user'}), 400
+        
+        target_scope = user_target.get('scope')
+        target_value = user_target.get('value')
+        
+        if target_scope == "admin_all":
+            notification_result = supabase.table("notifications").select("*").eq("id", notification_id).execute()
+        elif target_scope == "employee" and target_value:
+            notification_result = supabase.table("notifications").select("*").eq("id", notification_id).eq("to_employee", target_value).execute()
+        else:
+            return jsonify({'success': False, 'error': 'Invalid notification target'}), 400
+        
+        if not notification_result.data:
+            return jsonify({'success': False, 'error': 'Notification not found or not authorized'}), 404
+        
+        update_data = {
+            "is_read": True,
+            "read_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        result = supabase.table("notifications").update(update_data).eq("id", notification_id).execute()
+        
+        if result.data:
+            return jsonify({
+                'success': True,
+                'message': 'Notification marked as read',
+                'notification': result.data[0]
+            })
+        else:
+            return jsonify({'success': False, 'error': 'Failed to update notification'}), 500
+            
+    except Exception as e:
+        print(f"❌ mark_notification_read ERROR: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@notification_bp.route('/api/notifications/read-all', methods=['PUT'])
+@notifications_token_required
+def mark_all_notifications_read():
+    """Mark all notifications as read for current user"""
+    try:
+        supabase = get_supabase_client()
+        user_target = get_user_notification_target()
+        
+        if not user_target:
+            return jsonify({'success': False, 'error': 'Could not identify user'}), 400
+
+        update_data = {
+            "is_read": True,
+            "read_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        target_scope = user_target.get('scope')
+        target_value = user_target.get('value')
+        
+        if target_scope == "admin_all":
+            result = supabase.table("notifications").update(update_data).eq("is_read", False).execute()
+        elif target_scope == "employee" and target_value:
+            result = supabase.table("notifications").update(update_data).eq("to_employee", target_value).eq("is_read", False).execute()
+        else:
+            return jsonify({'success': False, 'error': 'Invalid notification target'}), 400
+        
+        return jsonify({
+            'success': True,
+            'message': f'Marked {len(result.data) if result.data else 0} notifications as read'
+        })
+            
+    except Exception as e:
+        print(f"❌ mark_all_notifications_read ERROR: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@notification_bp.route('/api/notifications/count', methods=['GET'])
+@notifications_token_required
+def get_notification_count():
+    """Get unread notification count for current user"""
+    try:
+        supabase = get_supabase_client()
+        user_target = get_user_notification_target()
+        
+        if not user_target:
+            return jsonify({'success': False, 'error': 'Could not identify user'}), 400
+        
+        target_scope = user_target.get('scope')
+        target_value = user_target.get('value')
+        
+        if target_scope == "admin_all":
+            result = supabase.table("notifications").select("id", count="exact").eq("is_read", False).execute()
+        elif target_scope == "employee" and target_value:
+            result = supabase.table("notifications").select("id", count="exact").eq("to_employee", target_value).eq("is_read", False).execute()
+        else:
+            return jsonify({'success': False, 'error': 'Invalid notification target'}), 400
+        
+        unread_count = result.count if hasattr(result, 'count') else 0
+        
+        return jsonify({
+            'success': True,
+            'unread_count': unread_count
+        })
+        
+    except Exception as e:
+        print(f"❌ get_notification_count ERROR: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@notification_bp.route('/api/notifications/<notification_id>', methods=['DELETE'])
+@notifications_token_required
+def delete_notification(notification_id):
+    """Delete a notification"""
+    try:
+        supabase = get_supabase_client()
+        user_target = get_user_notification_target()
+        
+        if not user_target:
+            return jsonify({'success': False, 'error': 'Could not identify user'}), 400
+        
+        target_scope = user_target.get('scope')
+        target_value = user_target.get('value')
+        
+        if target_scope == "admin_all":
+            notification_result = supabase.table("notifications").select("*").eq("id", notification_id).execute()
+        elif target_scope == "employee" and target_value:
+            notification_result = supabase.table("notifications").select("*").eq("id", notification_id).eq("to_employee", target_value).execute()
+        else:
+            return jsonify({'success': False, 'error': 'Invalid notification target'}), 400
+        
+        if not notification_result.data:
+            return jsonify({'success': False, 'error': 'Notification not found or not authorized'}), 404
+        
+        result = supabase.table("notifications").delete().eq("id", notification_id).execute()
+        
+        if result.data:
+            return jsonify({
+                'success': True,
+                'message': 'Notification deleted'
+            })
+        else:
+            return jsonify({'success': False, 'error': 'Failed to delete notification'}), 500
+            
+    except Exception as e:
+        print(f"❌ delete_notification ERROR: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ===== DEBUG ENDPOINTS =====
+@notification_bp.route('/api/notifications/debug', methods=['GET'])
+@notifications_token_required
+def debug_notifications():
+    """Debug endpoint for notifications"""
+    user_target = get_user_notification_target()
+    
+    debug_info = {
+        'g_user': getattr(g, 'user', 'Not set'),
+        'user_target': user_target,
+        'user_role': g.user.get('role') if hasattr(g, 'user') and g.user else 'No role',
+        'user_email': g.user.get('email') if hasattr(g, 'user') and g.user else 'No email',
+        'employee_id': g.user.get('employee_id') if hasattr(g, 'user') and g.user else 'No employee_id',
+        'timestamp': datetime.utcnow().isoformat()
+    }
+    
+    return jsonify({
+        'success': True,
+        'debug_info': debug_info
+    })
+
+@notification_bp.route('/api/notifications/test-g-user', methods=['GET'])
+@notifications_token_required
+def test_g_user():
+    """Test g.user directly"""
+    response = {
+        'success': True,
+        'g_user': getattr(g, 'user', 'Not set'),
+        'g_user_keys': list(g.user.keys()) if hasattr(g, 'user') and g.user else 'No keys'
+    }
+    
+    return jsonify(response)
+
+@notification_bp.route('/api/notifications/test-query', methods=['GET'])
+@notifications_token_required
+def test_notifications_query():
+    """Test the actual Supabase query"""
+    try:
+        supabase = get_supabase_client()
+        
+        admin_result = supabase.table("notifications").select("*").order("created_at", desc=True).execute()
+        employee_result = supabase.table("notifications").select("*").eq("to_employee", "dummy").order("created_at", desc=True).execute()
+        
+        return jsonify({
+            'success': True,
+            'admin_query_count': len(admin_result.data) if admin_result.data else 0,
+            'employee_query_count': len(employee_result.data) if employee_result.data else 0
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ===== NON-AUTH ENDPOINTS =====
+@notification_bp.route('/api/notifications/health', methods=['GET'])
+def notification_health_check():
+    return jsonify({
+        'success': True,
+        'message': 'Notifications API is working',
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
+@notification_bp.route('/api/notifications/test-data', methods=['GET'])
+def test_notifications_data():
+    """Test if notifications table has data"""
+    try:
+        supabase = get_supabase_client()
+        result = supabase.table("notifications").select("*").execute()
+        
+        return jsonify({
+            'success': True,
+            'notifications_count': len(result.data) if result.data else 0,
+            'sample_data': result.data[:3] if result.data else []
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@notification_bp.route('/api/notifications/admin-test', methods=['GET'])
+def admin_test_notifications():
+    """Test endpoint for admin notifications without auth restrictions"""
+    try:
+        supabase = get_supabase_client()
+        
+        # Manually set admin user context
+        g.user = {
+            'email': 'admin@leanchem.com',
+            'role': 'superadmin', 
+            'employee_id': '6562d78f-de15-41ae-b88a-faf808c32a2a'
+        }
+        
+        result = supabase.table("notifications").select("*").order("created_at", desc=True).execute()
+        notifications = result.data if result.data else []
+        unread_count = len([n for n in notifications if not n.get('is_read', False)])
+        
+        return jsonify({
+            'success': True,
+            'notifications': notifications,
+            'unread_count': unread_count,
+            'total': len(notifications)
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    
+def get_notification_flow_debug():
+    """Debug function to check notification flow"""
+    current_user_role = g.user.get('role') if hasattr(g, 'user') and g.user else None
+    current_user_employee_id = g.user.get('employee_id') if hasattr(g, 'user') and g.user else None
+    
+    return {
+        'current_user_role': current_user_role,
+        'current_user_employee_id': current_user_employee_id,
+        'timestamp': datetime.utcnow().isoformat()
+    }
+
+@notification_bp.route('/api/notifications/debug-flow', methods=['GET'])
+@notifications_token_required
+def debug_notification_flow():
+    """Debug notification flow"""
+    return jsonify({
+        'success': True,
+        'flow_info': get_notification_flow_debug()
+    })

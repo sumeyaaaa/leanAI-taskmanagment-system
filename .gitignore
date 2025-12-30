@@ -1,0 +1,42 @@
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Python
+.venv
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+frontedn_react/build/
+frontedn_react/dist/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Documentation (optional - remove if you want to keep these)
+AUTHENTICATION_FIXES.md
+REACT_LEARNING_GUIDE.md
+backend/RENDER_DEPLOYMENT.md
+backend/RENDER_FIX.md
+RENDER_DEPLOYMENT_GUIDE.md
+RENDER_DEPLOYMENT.md
+render.yaml
+
+
