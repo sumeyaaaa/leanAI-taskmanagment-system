@@ -14,6 +14,8 @@ const Sidebar: React.FC<SidebarProps> = ({ isAdmin, collapsed, onLogout }) => {
 
   const adminNavigation = [
     { path: '/admin/dashboard', label: ' Dashboard', icon: '📊' },
+    { path: '/admin/my-profile', label: ' My Profile', icon: '👤' },
+    { path: '/admin/my-tasks', label: ' My Tasks', icon: '📋' },
     { path: '/admin/employee-management', label: ' Employee Management', icon: '👥' },
     { path: '/admin/task-management', label: 'Task Management', icon: '🎯' },
     { path: '/admin/notifications', label: ' Notifications', icon: '🔔' },
