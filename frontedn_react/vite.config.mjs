@@ -7,6 +7,12 @@ export default defineConfig({
     outDir: 'build',
     emptyOutDir: true
   },
+  optimizeDeps: {
+    esbuildOptions: {
+      target: 'es2020'
+    },
+    include: ['react', 'react-dom', 'react-router-dom']
+  },
   server: {
     proxy: {
       '/api': {
@@ -16,3 +22,4 @@ export default defineConfig({
     }
   }
 })
+
